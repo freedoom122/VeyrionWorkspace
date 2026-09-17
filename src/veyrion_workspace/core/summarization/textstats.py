@@ -38,7 +38,20 @@ def summarize(text: str, max_sentences: int = 5) -> list[str]:
     """Extractive summary: score sentences by word frequency & position."""
     sentences = [s.strip() for s in _SENT_RE.findall(text) if len(s.strip()) > 25]
     if not sentences:
-        return []
+        # No sentence punctuation (raw notes, lists, logs): treat
+        # paragraphs or ~40-word windows as pseudo-sentences.
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}|\r\n\r\n", text)
+                      if p.strip()]
+        if not paragraphs:
+            paragraphs = [text.strip()]
+        chunks: list[str] = []
+        for para in paragraphs:
+            words = para.split()
+            for start in range(0, len(words), 40):
+                chunk = words[start:start + 40]
+                if len(chunk) >= 6:
+                    chunks.append(" ".join(chunk))
+        return chunks[:max_sentences]
     if len(sentences) <= max_sentences:
         return sentences
     freq: dict[str, int] = {}

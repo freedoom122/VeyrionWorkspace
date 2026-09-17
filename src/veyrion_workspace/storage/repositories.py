@@ -120,14 +120,16 @@ class LibraryRepository:
             "SELECT id FROM documents WHERE path=?", (rec.path,)
         )
         if existing:
+            # metadata_json is intentionally untouched: rescans must not
+            # destroy metadata stored by other features.
             self._db.execute(
                 """UPDATE documents SET title=?, author=?, subject=?, keywords=?,
                    kind=?, format=?, size_bytes=?, page_count=?, word_count=?,
-                   folder=?, last_modified=?, metadata_json=?
+                   folder=?, last_modified=?
                    WHERE id=?""",
                 (rec.title, rec.author, rec.subject, rec.keywords, rec.kind,
                  rec.format, rec.size_bytes, rec.page_count, rec.word_count,
-                 rec.folder, now, "{}", existing["id"]),
+                 rec.folder, now, existing["id"]),
             )
             return existing["id"]
         cur = self._db.execute(
@@ -378,6 +380,20 @@ class SessionRepository:
 class SmartCollectionRepository:
     def __init__(self, db) -> None:
         self._db = db
+
+    def add(self, name: str, rules_json: str, built_in: bool = False) -> int:
+        """Insert a smart collection; returns its row id (existing id if the
+        name already exists, matching the built-in INSERT OR IGNORE)."""
+        row = self._db.query_one(
+            "SELECT id FROM smart_collections WHERE name=?", (name,))
+        if row is not None:
+            return int(row["id"])
+        self._db.execute(
+            "INSERT INTO smart_collections (name, rules_json, built_in) "
+            "VALUES (?, ?, ?)", (name, rules_json, int(built_in)))
+        row = self._db.query_one(
+            "SELECT id FROM smart_collections WHERE name=?", (name,))
+        return int(row["id"])
 
     def all(self) -> list[dict[str, Any]]:
         return [dict(r) for r in self._db.query(

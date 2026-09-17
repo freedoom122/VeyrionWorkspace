@@ -20,6 +20,20 @@ logger = logging.getLogger("veyrion.settings")
 
 SCHEMA_VERSION = 1
 
+# Enum-valued settings: only these values are accepted on write and load.
+# Anything else is rejected (previous value kept) and logged.
+_ENUM_SETTINGS: dict[tuple[str, str], frozenset] = {
+    ("appearance", "theme"): frozenset(
+        {"light", "dark", "oled", "sepia", "high-contrast"}),
+}
+
+
+def _is_allowed_value(section: str, key: str, value: Any) -> bool:
+    """True when *value* is legal (unregulated keys always allow)."""
+    choices = _ENUM_SETTINGS.get((section, key))
+    return choices is None or value in choices
+
+
 DEFAULTS: dict[str, Any] = {
     "general": {
         "first_run_complete": False,
@@ -52,6 +66,10 @@ DEFAULTS: dict[str, Any] = {
         "epub_theme": "light",
         "comic_rtl": False,
         "comic_double": False,
+        "pdf_gap": 14,                 # two-page spread gap (points)
+        "pdf_cover_offset": False,     # offset first page in two-cover mode
+        "pdf_theme": "",               # per-view PDF theme; "" = app theme
+        "toolbar_items": [],           # #78: visible toolbar item keys, in order
     },
     "annotations": {
         "default_color": "#E5B25D",
@@ -59,6 +77,9 @@ DEFAULTS: dict[str, Any] = {
         "ink_width": 2.2,
         "font_size": 11,
         "author": "Me",
+        "panel_scope": 0,              # AnnotationsPanel scope combo index
+        "panel_type_filter": 0,        # AnnotationsPanel type-filter combo index
+        "panel_chips": [],             # AnnotationsPanel active legend-chip groups
     },
     "ocr": {
         "enabled": True,
@@ -167,6 +188,10 @@ class Settings:
 
     def set(self, section: str, key: str, value: Any, save: bool = True) -> None:
         with self._lock:
+            if not _is_allowed_value(section, key, value):
+                logger.warning(
+                    "rejected invalid setting %s.%s = %r", section, key, value)
+                return
             self._data.setdefault(section, {})[key] = value
             if save:
                 self.save()
@@ -228,4 +253,14 @@ def _merge_validated(target: dict[str, Any], incoming: dict[str, Any]) -> None:
                         continue
                     if isinstance(tv, float) and isinstance(value, int):
                         value = float(value)
+                if not _is_allowed_value(section, key, value):
+                    logger.warning("Dropping invalid setting %s.%s (not an allowed choice)",
+                                   section, key)
+                    continue
+                target[section][key] = value
+            else:
+                # Unknown keys (plugins, future versions, user hand-edits)
+                # must survive a reload: keep them verbatim. Type mismatches
+                # alone never justify destroying data we do not model.
+                target[section].setdefault(key, value)
                 target[section][key] = value

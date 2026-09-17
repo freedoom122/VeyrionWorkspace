@@ -149,3 +149,66 @@ def db(data_dir: Path):
 def settings(data_dir: Path):
     from veyrion_workspace.services.settings import Settings
     return Settings()
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """One offscreen QApplication shared by all UI tests."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+@pytest.fixture()
+def main_window(qapp, data_dir):
+    """A real MainWindow over isolated services (closed on teardown)."""
+    from veyrion_workspace.services.recovery import SessionJournal
+    from veyrion_workspace.services.settings import Settings
+    from veyrion_workspace.services.tasks import TaskManager
+    from veyrion_workspace.storage.database import Database
+    from veyrion_workspace.ui.main_window import MainWindow
+    settings = Settings()
+    db = Database()
+    tasks = TaskManager(2)
+    journal = SessionJournal(data_dir / "sessions")
+    w = MainWindow(settings, db, tasks, journal)
+    w.resize(1200, 800)
+    yield w, settings
+    w.close()
+    w.deleteLater()
+    db.close()
+
+
+@pytest.fixture()
+def app_launcher(qapp, data_dir):
+    """Factory that boots a full MainWindow over the shared data dir.
+
+    Each call simulates a fresh app launch: brand-new Settings (re-read from
+    ``settings.json`` on disk), database, task manager, and session journal.
+    Returns ``(window, settings)``; every window opened this way is closed on
+    teardown.
+    """
+    from veyrion_workspace.services.recovery import SessionJournal
+    from veyrion_workspace.services.settings import Settings
+    from veyrion_workspace.services.tasks import TaskManager
+    from veyrion_workspace.storage.database import Database
+    from veyrion_workspace.ui.main_window import MainWindow
+
+    opened: list[tuple] = []
+
+    def launch():
+        settings = Settings()
+        db = Database()
+        tasks = TaskManager(2)
+        journal = SessionJournal(data_dir / "sessions")
+        w = MainWindow(settings, db, tasks, journal)
+        w.resize(1200, 800)
+        opened.append((w, db))
+        return w, settings
+
+    yield launch
+    for w, db in opened:
+        w.close()
+        w.deleteLater()
+        db.close()

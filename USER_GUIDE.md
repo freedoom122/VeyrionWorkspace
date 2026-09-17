@@ -311,8 +311,11 @@ Keyboard, Updates, and Data (shows where everything lives: database, cache,
 logs, backups, plugins).
 
 - Reset any category, or restore all defaults.
-- **Keyboard**: remap shortcuts, enable Vim-style navigation
-  (`j`/`k`/`gg`/`G`).
+- **Keyboard**: remap shortcuts by pasting a JSON map. *Edit Shortcut
+  Overrides File…* creates and opens `shortcuts.json` in your settings
+  folder — fill in the actions you want to change, then *Reload Shortcut
+  Overrides* applies it immediately (no restart, and the F1 sheet follows
+  along). Vim-style navigation (`j`/`k`/`gg`/`G`) is a separate toggle here.
 - **Accessibility**: large UI, large text, dyslexia-friendly font, reduced
   motion, high contrast — in Appearance.
 - **Performance**: page cache size, thumbnail workers, prefetch distance.
@@ -345,11 +348,31 @@ logs, backups, plugins).
 | `Ctrl+B/I/U`    | Bold / italic / underline         |
 | `Ctrl+,`        | Settings                          |
 | `Ctrl+Tab`      | Next tab                          |
+| `F1`            | Keyboard shortcuts cheat sheet     |
+| — (click status) | Reading summary (export/print)   |
+| `F5`            | Presentation mode                 |
+| `F8` / `F9`     | Distraction-free / focus mode     |
 | `F11`           | Fullscreen                        |
 | `+` / `-`       | Zoom in / out                     |
 | `0`             | Fit width                         |
 | `PgUp` / `PgDn` | Previous / next page              |
 | `j` `k` `gg` `G`| Vim navigation (optional)         |
+
+Press `F1` for the complete list: it is generated from the app's own menus,
+so it always matches the build you are running. *Export…* writes whatever is
+currently shown as a printable PDF card, a CSV table (handy for spreadsheets),
+or a Markdown table you can paste straight into documentation, *Copy as
+Markdown* puts that same table on the clipboard without writing a file, and
+*Print…* shows a preview of the exact card first — cancelling sends nothing,
+approving sends it to your printer.
+
+The annotations panel, the reading summary, and the library panel (its export
+button exports the selected documents — or the whole filtered view when nothing
+is selected — with pages, size, progress, rating and tags) all export and
+print the same way, so those are the places to look whenever you want a record
+of what is on screen. Rows whose key you have remapped are marked as custom, and
+the status line reports anything a pasted key map got wrong (an unknown action
+id, an unreadable key, or a binding that now clashes with another action).
 
 ## 23. Data locations
 

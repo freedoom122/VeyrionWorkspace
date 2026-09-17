@@ -31,12 +31,22 @@ from veyrion_workspace.core.search.engine import SearchEngine
 from veyrion_workspace.core.versioning import VersionStore
 from veyrion_workspace.services.recovery import SessionJournal
 from veyrion_workspace.services.settings import Settings
+from veyrion_workspace.services.shortcuts import (
+    ShortcutReport,
+    apply_overrides,
+    collect_actions,
+    overrides_path,
+    read_overrides,
+    write_template,
+)
 from veyrion_workspace.services.tasks import TaskManager
 from veyrion_workspace.storage.database import Database
 from veyrion_workspace.storage.repositories import (
     AnnotationRepository, LibraryRepository, NoteRepository, ProgressRepository,
+    SessionRepository,
 )
 from veyrion_workspace.ui.command_palette import Command, CommandPalette
+from veyrion_workspace.ui.shortcuts_dialog import ShortcutsDialog
 from veyrion_workspace.ui.dialogs import (
     AboutDialog, get_password, show_error, show_toast_msg,
 )
@@ -49,9 +59,19 @@ from veyrion_workspace.ui.panels.library_panel import LibraryPanel
 from veyrion_workspace.ui.document_view import DocumentView
 from veyrion_workspace.ui.tabwidget import DocumentTabWidget
 from veyrion_workspace.ui.theme import build_qss, get_palette
-from veyrion_workspace.ui.widgets import NavRail, show_toast
+from veyrion_workspace.ui.widgets import (
+    ClickableLabel,
+    NavRail,
+    show_actionable_toast,
+    show_toast,
+)
 from veyrion_workspace.ui.views.factory import create_view
 from veyrion_workspace.utils.pathutils import format_size
+
+
+import logging
+
+logger = logging.getLogger("veyrion.mainwin")
 
 
 class MainWindow(QMainWindow):
@@ -69,6 +89,7 @@ class MainWindow(QMainWindow):
         self._progress = ProgressRepository(db)
         self._annotations = AnnotationService(AnnotationRepository(db), settings)
         self._search_engine = SearchEngine(db)
+        self._sessions = SessionRepository(db)
         self._fullscreen = False
         self._focus_mode = False
         self._session_start = time.time()
@@ -91,10 +112,27 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._restore_window_state()
 
+        # Apply any user-pasted shortcut map before the window is shown so
+        # the menus, the cheat sheet and the palette all agree from the start.
+        self.shortcut_report: ShortcutReport = ShortcutReport()
+        self._apply_shortcut_overrides(notify=False)
+
         self._journal_timer = QTimer(self)
         self._journal_timer.setInterval(15000)
         self._journal_timer.timeout.connect(self._record_session)
         self._journal_timer.start()
+
+        # Distraction-free mode (#79) persists across restarts.
+        if bool(self.settings.get("reading", "distraction_free", False)):
+            self._apply_distraction_free(True)
+            self.act_distraction.setChecked(True)
+
+        # Point users at the shortcut cheat sheet once, after onboarding
+        # has completed. Modeless so it never blocks startup or tests.
+        if bool(self.settings.get("general", "first_run_complete", False)) \
+                and not bool(self.settings.get("shortcuts", "hint_shown", False)):
+            self.settings.set("shortcuts", "hint_shown", True)
+            QTimer.singleShot(1200, self._show_shortcuts_once)
 
     # ================================================================ theme
     def _apply_theme(self) -> None:
@@ -120,6 +158,13 @@ class MainWindow(QMainWindow):
         self.tabs.tab_close_requested.connect(self.close_tab)
         self.tabs.tab_detach_requested.connect(self.detach_tab)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        # Periodic crash-journal heartbeat, parented to the window so it is
+        # collected with it (main.py no longer needs its own timer).
+        self._journal_timer = QTimer(self)
+        self._journal_timer.setInterval(30_000)
+        self._journal_timer.timeout.connect(self._record_session)
+        self._journal_timer.start()
         placeholder = self._make_placeholder()
         self._placeholder = placeholder
         self.setCentralWidget(placeholder)
@@ -148,6 +193,22 @@ class MainWindow(QMainWindow):
     def current_view_any(self) -> DocumentView | None:
         return self.current_view()
 
+    # -- SplitView-aware document collection -------------------------------
+    def _document_views_in(self, widget) -> list[DocumentView]:
+        """Every DocumentView hosted by *widget* (a tab may be a SplitView)."""
+        if isinstance(widget, DocumentView):
+            return [widget]
+        views = getattr(widget, "views", None)
+        if callable(views):
+            return [v for v in views() if isinstance(v, DocumentView)]
+        return []
+
+    def _all_document_views(self) -> list[DocumentView]:
+        out: list[DocumentView] = []
+        for i in range(self.tabs.count()):
+            out.extend(self._document_views_in(self.tabs.widget(i)))
+        return out
+
     # ================================================================ panels
     def _build_panels(self) -> None:
         self.library_panel = LibraryPanel(self._library, self.settings,
@@ -161,9 +222,11 @@ class MainWindow(QMainWindow):
         self.toc_panel.entry_selected.connect(self._goto_page)
         self.bookmarks_panel = BookmarksPanel(self.db)
         self.bookmarks_panel.bookmark_selected.connect(self._goto_page_scroll)
-        self.annotations_panel = AnnotationsPanel(self._annotations)
+        self.annotations_panel = AnnotationsPanel(self._annotations, self.settings)
         self.annotations_panel.annotation_selected.connect(
             lambda path, page: self._goto_page(page))
+        self.annotations_panel.flash_requested.connect(
+            self._flash_annotation_on_page)
         self.annotations_panel.set_document_filter("")
         self.notes_panel = NotesPanel(self._notes)
         self.search_panel = SearchPanel(self._search_engine)
@@ -311,6 +374,18 @@ class MainWindow(QMainWindow):
         self.act_prev_page.setShortcut(QKeySequence("Left"))
         self.act_prev_page.triggered.connect(self._prev_page)
 
+        self.act_goto_page = A("&Go to Page…", self)
+        self.act_goto_page.setShortcut(QKeySequence("Ctrl+G"))
+        self.act_goto_page.triggered.connect(self._goto_page_dialog)
+
+        self.act_nav_back = A("&Back", self)
+        self.act_nav_back.setShortcut(QKeySequence("Alt+Left"))
+        self.act_nav_back.triggered.connect(self._nav_back)
+
+        self.act_nav_forward = A("&Forward", self)
+        self.act_nav_forward.setShortcut(QKeySequence("Alt+Right"))
+        self.act_nav_forward.triggered.connect(self._nav_forward)
+
         self.act_ocr = A(icon("ocr", "#2A2721"), "Run &OCR…", self)
         self.act_ocr.triggered.connect(self.action_ocr)
 
@@ -369,6 +444,32 @@ class MainWindow(QMainWindow):
         self.act_focus.setCheckable(True)
         self.act_focus.setShortcut(QKeySequence("F9"))
         self.act_focus.triggered.connect(self.action_focus_mode)
+
+        # Distraction-free mode (#79): fades out ALL chrome (F8).
+        self.act_distraction = A(icon("focus", "#2A2721"),
+                                 "&Distraction-Free Mode", self)
+        self.act_distraction.setCheckable(True)
+        self.act_distraction.setShortcut(QKeySequence("F8"))
+        self.act_distraction.triggered.connect(self.action_distraction_free)
+
+        # Per-view page theme radios (#77) + spread tuning (#10).
+        self.act_themes = []
+        for key, label in (("", "&Follow App Theme"), ("light", "&Light"),
+                           ("sepia", "&Sepia"), ("dark", "&Dark"),
+                           ("oled", "O&LED Black")):
+            a = A(label, self)
+            a.setCheckable(True)
+            a.setData(key)
+            a.triggered.connect(lambda _=False, k=key: self._set_view_theme(k))
+            self.act_themes.append(a)
+        self.act_gap_tuning = A("Spread &Gap…", self)
+        self.act_gap_tuning.triggered.connect(self._gap_tuning_dialog)
+        self.act_themes[0].setChecked(True)   # follow app theme by default
+
+        # Customizable toolbar (#78).
+        self.act_customize_toolbar = A("&Customize Toolbar…", self)
+        self.act_customize_toolbar.triggered.connect(
+            self.action_customize_toolbar)
 
         self.act_present = A(icon("present", "#2A2721"), "&Presentation Mode", self)
         self.act_present.setShortcut(QKeySequence("F5"))
@@ -449,6 +550,16 @@ class MainWindow(QMainWindow):
         self.act_tool_stamp = A("Sta&mp", self)
         self.act_tool_stamp.triggered.connect(lambda: self._set_tool("stamp"))
 
+        self.act_tool_eraser = A("E&raser", self)
+        self.act_tool_eraser.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.act_tool_eraser.triggered.connect(
+            lambda: self._set_tool("eraser"))
+
+        # Phase 2 annotation editing: select existing markups on the page.
+        self.act_select_annots = A("Select &All Annotations", self)
+        self.act_select_annots.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.act_select_annots.triggered.connect(self._select_all_annotations)
+
         self.act_rotate_page = A(icon("rotate", "#2A2721"), "Rotate Page &Right", self)
         self.act_rotate_page.setShortcut(QKeySequence("Ctrl+R"))
         self.act_rotate_page.triggered.connect(self._rotate_page_right)
@@ -459,6 +570,50 @@ class MainWindow(QMainWindow):
         self.act_bookmark = A(icon("bookmark", "#C7522A"), "Add Book&mark", self)
         self.act_bookmark.setShortcut(QKeySequence("Ctrl+B"))
         self.act_bookmark.triggered.connect(self._add_bookmark)
+
+        # Reading-experience actions (roadmap #7, #8, #59).
+        self.act_autoscroll = A("&Autoscroll", self)
+        self.act_autoscroll.setCheckable(True)
+        self.act_autoscroll.setShortcut(QKeySequence("Space"))
+        self.act_autoscroll.triggered.connect(self._toggle_autoscroll)
+
+        self.act_slideshow = A("Slideshow &Auto-Advance…", self)
+        self.act_slideshow.setCheckable(True)
+        self.act_slideshow.triggered.connect(self._toggle_slideshow)
+
+        self.act_rtl = A("&Right-to-Left (Manga) Mode", self)
+        self.act_rtl.setCheckable(True)
+        self.act_rtl.triggered.connect(self._toggle_rtl)
+
+        # Reference surface: the reading report behind the status bar.
+        self.act_reading_summary = A("Reading Su&mmary…", self)
+        self.act_reading_summary.setToolTip(
+            "Pages, progress, time read and history — exportable or printable")
+        self.act_reading_summary.triggered.connect(self.action_reading_summary)
+
+        # Keyboard shortcuts cheat sheet (discoverability).
+        self.act_shortcuts = A("&Keyboard Shortcuts…", self)
+        self.act_shortcuts.setShortcut(QKeySequence("F1"))
+        self.act_shortcuts.setToolTip("Every action and its key (F1)")
+        self.act_shortcuts.triggered.connect(self._show_shortcuts)
+
+        # User-pasted shortcut map (shortcuts.json).
+        self.act_shortcut_file = A("Edit Shortcut &Overrides File…", self)
+        self.act_shortcut_file.setToolTip(
+            "Open shortcuts.json and paste your own key map")
+        self.act_shortcut_file.triggered.connect(self.action_edit_shortcuts_file)
+
+        self.act_shortcuts_reload = A("&Reload Shortcut Overrides", self)
+        self.act_shortcuts_reload.setToolTip(
+            "Re-read shortcuts.json and rebind the app now")
+        self.act_shortcuts_reload.triggered.connect(
+            self.action_reload_shortcut_overrides)
+
+        self.act_shortcuts_reset = A("Reset Shortcut Overrides", self)
+        self.act_shortcuts_reset.setToolTip(
+            "Return every action to its built-in binding for this session")
+        self.act_shortcuts_reset.triggered.connect(
+            self.action_reset_shortcut_overrides)
 
     # ================================================================ menus
     def _build_menus(self) -> None:
@@ -499,8 +654,25 @@ class MainWindow(QMainWindow):
         m_view.addSeparator()
         m_view.addAction(self.act_next_page)
         m_view.addAction(self.act_prev_page)
+        m_view.addAction(self.act_goto_page)
+        m_view.addSeparator()
+        m_view.addAction(self.act_nav_back)
+        m_view.addAction(self.act_nav_forward)
+        m_view.addSeparator()
+        m_view.addAction(self.act_autoscroll)
+        m_view.addAction(self.act_slideshow)
+        m_view.addAction(self.act_rtl)
+        m_view.addAction(self.act_reading_summary)
+        m_view.addSeparator()
+        m_gap_menu = m_view.addMenu("Page &Theme")
+        for a in self.act_themes:
+            m_gap_menu.addAction(a)
+        m_view.addAction(self.act_gap_tuning)
+        m_view.addSeparator()
+        m_view.addAction(self.act_distraction)
         m_view.addSeparator()
         m_view.addAction(self.act_focus)
+        m_view.addAction(self.act_customize_toolbar)
         m_view.addAction(self.act_present)
         m_view.addAction(self.act_fullscreen)
         m_view.addSeparator()
@@ -522,6 +694,8 @@ class MainWindow(QMainWindow):
         m_annot.addAction(self.act_tool_arrow)
         m_annot.addAction(self.act_tool_freetext)
         m_annot.addAction(self.act_tool_stamp)
+        m_annot.addSeparator()
+        m_annot.addAction(self.act_select_annots)
         m_annot.addSeparator()
         m_annot.addAction(self.act_bookmark)
         m_annot.addSeparator()
@@ -568,57 +742,179 @@ class MainWindow(QMainWindow):
         m_settings.addAction(self.act_logs)
         m_settings.addAction(self.act_diagnostics)
         m_settings.addSeparator()
+        m_settings.addAction(self.act_shortcuts)
+        m_settings.addAction(self.act_shortcut_file)
+        m_settings.addAction(self.act_shortcuts_reload)
+        m_settings.addAction(self.act_shortcuts_reset)
+        m_settings.addSeparator()
         m_settings.addAction(self.act_about)
 
     # ================================================================ toolbar
+    # Customizable toolbar registry (#78): (key, label) in default order.
+    # Settings persist the ordered list; a "-" prefix hides the item.
+    TOOLBAR_ITEMS: list[tuple[str, str]] = [
+        ("open", "Open"), ("save", "Save"), ("sep1", "separator"),
+        ("zoom_out", "Zoom out"), ("zoom_in", "Zoom in"),
+        ("fit_width", "Fit width"), ("sep2", "separator"),
+        ("prev_page", "Previous page"), ("next_page", "Next page"),
+        ("nav_back", "Reading history back"),
+        ("nav_forward", "Reading history forward"), ("sep3", "separator"),
+        ("goto_box", "Go-to-page box"), ("sep4", "separator"),
+        ("tool_highlight", "Highlight tool"), ("tool_note", "Sticky note tool"),
+        ("tool_ink", "Draw tool"), ("tool_freetext", "Text box tool"),
+        ("tool_eraser", "Eraser tool"), ("sep5", "separator"),
+        ("rotate_page", "Rotate page"), ("print", "Print"),
+        ("ocr", "Run OCR"), ("read_aloud", "Read aloud"),
+        ("sep6", "separator"), ("palette_btn", "Command palette"),
+        ("search_box", "Search box"),
+    ]
+    TOOLBAR_DEFAULTS: list[str] = [k for k, _ in TOOLBAR_ITEMS]
+
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main")
         tb.setObjectName("mainToolbar")
         tb.setMovable(False)
         tb.setIconSize(QSize(18, 18))
         self.addToolBar(tb)
-        tb.addAction(self.act_open)
-        tb.addAction(self.act_save)
-        tb.addSeparator()
-        tb.addAction(self.act_zoom_out)
-        tb.addAction(self.act_zoom_in)
-        tb.addAction(self.act_fit_width)
-        tb.addSeparator()
-        tb.addAction(self.act_prev_page)
-        tb.addAction(self.act_next_page)
-        tb.addSeparator()
+        # QMainWindow has no toolbar() getter; keep a reference (also fixes
+        # the latent AttributeError in focus mode).
+        self.main_toolbar = tb
+        self._render_toolbar_items()
+
+    def _render_toolbar_items(self) -> None:
+        """Rebuild the toolbar from the persisted item order (#78)."""
+        tb = self.main_toolbar
+        tb.clear()
         self._tool_buttons: dict[str, QToolButton] = {}
-        for tool, tip in (("highlight", "Highlight"), ("note", "Sticky note"),
-                          ("ink", "Draw"), ("freetext", "Text box")):
+        saved = self.settings.get("reading", "toolbar_items", [])
+        if not isinstance(saved, list) or not saved:
+            saved = list(self.TOOLBAR_DEFAULTS)
+        valid = {k for k, _ in self.TOOLBAR_ITEMS}
+        keys = [str(k).lstrip("-") for k in saved if str(k).lstrip("-") in valid]
+        seen: set[str] = set()
+        keys = [k for k in keys if not (k in seen or seen.add(k))]
+        keys += [k for k in self.TOOLBAR_DEFAULTS if k not in keys]
+        hidden = {str(k)[1:] for k in saved
+                  if isinstance(k, str) and k.startswith("-")}
+        for key in keys:
+            if key in hidden:
+                continue
+            self._add_toolbar_item(tb, key)
+
+    def _add_toolbar_item(self, tb: QToolBar, key: str) -> None:
+        """Append one registered item (action, widget, or separator)."""
+        if key.startswith("sep"):
+            tb.addSeparator()
+            return
+        if key in ("open", "save", "zoom_out", "zoom_in", "fit_width",
+                   "prev_page", "next_page", "nav_back", "nav_forward",
+                   "rotate_page", "print", "ocr", "read_aloud"):
+            tb.addAction(getattr(self, f"act_{key}"))
+            return
+        if key == "goto_box":
+            from PySide6.QtWidgets import QLineEdit
+            from PySide6.QtGui import QIntValidator
+            self._goto_box = QLineEdit()
+            self._goto_box.setPlaceholderText("Page")
+            self._goto_box.setFixedWidth(64)
+            self._goto_box.setValidator(QIntValidator(1, 999999, self._goto_box))
+            self._goto_box.setClearButtonEnabled(True)
+            self._goto_box.setToolTip("Go to page (Enter)")
+            self._goto_box.returnPressed.connect(self._goto_box_commit)
+            tb.addWidget(self._goto_box)
+            return
+        if key.startswith("tool_"):
+            tool = key[len("tool_"):]
+            meta = {"highlight": ("Highlight", "highlighter"),
+                    "note": ("Sticky note", "note"),
+                    "ink": ("Draw", "ink"),
+                    "freetext": ("Text box", "text"),
+                    "eraser": ("Eraser", "eraser")}.get(tool)
+            if meta is None:
+                return
+            tip, icon_name = meta
             btn = QToolButton()
-            icon_name = {"highlight": "highlighter", "note": "note",
-                         "ink": "ink", "freetext": "text"}[tool]
             btn.setIcon(icon(icon_name, "#2A2721"))
             btn.setToolTip(tip)
             btn.setCheckable(True)
             btn.clicked.connect(lambda _=False, t=tool: self._set_tool(t))
             self._tool_buttons[tool] = btn
             tb.addWidget(btn)
-        tb.addSeparator()
-        tb.addAction(self.act_rotate_page)
-        tb.addAction(self.act_print)
-        tb.addAction(self.act_ocr)
-        tb.addAction(self.act_read_aloud)
-        tb.addSeparator()
-        palette_btn = QToolButton()
-        palette_btn.setIcon(icon("command", "#2A2721"))
-        palette_btn.setToolTip("Command palette (Ctrl+K)")
-        palette_btn.clicked.connect(self._open_palette)
-        tb.addWidget(palette_btn)
-        spacer = QWidget()
-        from PySide6.QtWidgets import QSizePolicy
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        tb.addWidget(spacer)
-        search_widget = self.search_panel._query
-        search_widget.setParent(None)
-        search_widget.setPlaceholderText("Search library & documents… (Ctrl+K for commands)")
-        search_widget.setMaximumWidth(280)
-        tb.addWidget(search_widget)
+            return
+        if key == "palette_btn":
+            palette_btn = QToolButton()
+            palette_btn.setIcon(icon("command", "#2A2721"))
+            palette_btn.setToolTip("Command palette (Ctrl+K)")
+            palette_btn.clicked.connect(self._open_palette)
+            tb.addWidget(palette_btn)
+            return
+        if key == "search_box":
+            search_widget = self.search_panel._query
+            search_widget.setParent(None)
+            search_widget.setPlaceholderText(
+                "Search library & documents… (Ctrl+K for commands)")
+            search_widget.setMaximumWidth(280)
+            tb.addWidget(search_widget)
+
+    def action_customize_toolbar(self) -> None:
+        """Reorder (drag) and hide/show toolbar items; persisted (#78)."""
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
+                                       QListWidget, QListWidgetItem,
+                                       QPushButton, QVBoxLayout)
+        saved = self.settings.get("reading", "toolbar_items", [])
+        if not isinstance(saved, list) or not saved:
+            saved = list(self.TOOLBAR_DEFAULTS)
+        labels = dict(self.TOOLBAR_ITEMS)
+        keys = [str(k).lstrip("-") for k in saved if str(k).lstrip("-") in labels]
+        seen: set[str] = set()
+        keys = [k for k in keys if not (k in seen or seen.add(k))]
+        keys += [k for k in self.TOOLBAR_DEFAULTS if k not in keys]
+        hidden = {str(k)[1:] for k in saved
+                  if isinstance(k, str) and k.startswith("-")}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Customize toolbar")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Drag to reorder. Untick an item to hide it."))
+        lst = QListWidget()
+        lst.setDragDropMode(QListWidget.InternalMove)
+        for key in keys:
+            item = QListWidgetItem(labels.get(key, key))
+            item.setData(Qt.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked if key in hidden else Qt.Checked)
+            lst.addItem(item)
+        lay.addWidget(lst, 1)
+        row = QHBoxLayout()
+        reset = QPushButton("Reset to default")
+        reset.clicked.connect(lambda: self._reset_toolbar_list(lst))
+        row.addWidget(reset)
+        row.addStretch(1)
+        lay.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        order: list[str] = []
+        for i in range(lst.count()):
+            it = lst.item(i)
+            key = it.data(Qt.UserRole)
+            order.append(key if it.checkState() == Qt.Checked else f"-{key}")
+        self.settings.set("reading", "toolbar_items", order)
+        self._render_toolbar_items()
+
+    def _reset_toolbar_list(self, lst) -> None:
+        """Restore the dialog list to the default order, all visible."""
+        from PySide6.QtWidgets import QListWidgetItem
+        lst.clear()
+        for key, label in self.TOOLBAR_ITEMS:
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            lst.addItem(item)
 
     # ================================================================ statusbar
     def _build_statusbar(self) -> None:
@@ -629,6 +925,18 @@ class MainWindow(QMainWindow):
         self._status_zoom = QLabel("")
         self._status_tasks = QLabel("")
         self._status_doc_state = QLabel("")
+        # Reading progress (#9): “42% read · page 7 of 16”. Clickable: the
+        # segment opens the full reading summary, which can be exported or
+        # printed like the other reference surfaces.
+        self._status_progress = ClickableLabel("")
+        self._status_progress.setToolTip(
+            "Click for the reading summary (export or print it)")
+        self._status_progress.clicked.connect(self.action_reading_summary)
+        # Enhanced status segments (#81): active tool, markup count,
+        # reading time.
+        self._status_tool = QLabel("")
+        self._status_annots = QLabel("")
+        self._status_reading = QLabel("")
         self._progress_bar = QProgressBar()
         self._progress_bar.setFixedWidth(160)
         self._progress_bar.setRange(0, 100)
@@ -637,6 +945,10 @@ class MainWindow(QMainWindow):
         sb.addWidget(self._status_doc_state)
         sb.addPermanentWidget(self._progress_bar)
         sb.addPermanentWidget(self._status_tasks)
+        sb.addPermanentWidget(self._status_tool)
+        sb.addPermanentWidget(self._status_annots)
+        sb.addPermanentWidget(self._status_reading)
+        sb.addPermanentWidget(self._status_progress)
         sb.addPermanentWidget(self._status_zoom)
         sb.addPermanentWidget(self._status_page)
 
@@ -662,10 +974,38 @@ class MainWindow(QMainWindow):
         add("Save", self.action_save, "Ctrl+S", "save")
         add("Save As", self.action_save_as, "Ctrl+Shift+S", "save")
         add("Export…", self.action_export, "", "convert", "export convert")
+        add("Select All Annotations", self.act_select_annots, "Ctrl+Shift+A",
+            "command", "select annotations markups edit move resize")
         add("Print…", self.action_print, "Ctrl+P", "print")
         add("Find in Document", self.action_find, "Ctrl+F", "search", "find search")
+        add("Undo", self.action_undo, "Ctrl+Z", "undo", "undo revert annotation")
+        add("Redo", self.action_redo, "Ctrl+Y", "redo", "redo reapply")
+        add("Reading History: Back", self._nav_back, "Alt+Left", "page",
+            "back previous location history")
+        add("Reading History: Forward", self._nav_forward, "Alt+Right", "page",
+            "forward next location history")
+        add("Go to Page…", self._goto_page_dialog, "Ctrl+G", "page",
+            "goto jump page number")
+        add("Reading Summary…", self.action_reading_summary, "", "info",
+            "reading progress stats summary report time pages export print")
+        add("Autoscroll", self._toggle_autoscroll, "Space", "page",
+            "autoscroll scroll automatic hands-free")
+        add("Slideshow Auto-Advance", self._toggle_slideshow, "", "present",
+            "slideshow auto advance timer presentation")
+        add("Toggle Right-to-Left (Manga) Mode", self._toggle_rtl, "", "page",
+            "rtl right-to-left manga reading order")
         add("Toggle Dark Mode", self.action_toggle_theme, "", "moon", "theme dark light")
         add("Enter Focus Mode", self.action_focus_mode, "F9", "focus")
+        add("Toggle Distraction-Free Mode", self.action_distraction_free, "F8",
+            "focus", "distraction free hide chrome zen minimal")
+        add("Spread Gap Tuning…", self._gap_tuning_dialog, "", "page",
+            "gap spread two-page spacing cover offset")
+        add("Customize Toolbar…", self.action_customize_toolbar, "",
+            "settings", "toolbar customize reorder hide items")
+        add("Page Theme: Sepia", lambda: self._set_view_theme("sepia"), "",
+            "moon", "sepia theme page warm")
+        add("Page Theme: Dark", lambda: self._set_view_theme("dark"), "",
+            "moon", "dark theme page night")
         add("Presentation Mode", self.action_presentation, "F5", "present")
         add("Run OCR", self.action_ocr, "", "ocr", "text recognition")
         add("Read Aloud", self.action_read_aloud, "", "speaker", "tts speech")
@@ -675,6 +1015,15 @@ class MainWindow(QMainWindow):
         add("Secure Vault", self.action_vault, "", "lock", "vault encryption")
         add("Privacy Dashboard", self.action_privacy, "", "shield", "privacy")
         add("Settings", self.action_settings, "Ctrl+,", "settings")
+        add("Keyboard Shortcuts", self._show_shortcuts, "F1", "info",
+            "shortcuts keys hotkeys cheat sheet help discover f1 f8 f9")
+        add("Reload Shortcut Overrides", self.action_reload_shortcut_overrides,
+            "", "settings",
+            "shortcuts keymap overrides file reload rebind paste json")
+        add("Edit Shortcut Overrides File…", self.action_edit_shortcuts_file,
+            "", "settings", "shortcuts keymap overrides file edit open json")
+        add("Reset Shortcut Overrides", self.action_reset_shortcut_overrides,
+            "", "settings", "shortcuts keymap overrides reset default restore")
         add("Library: Import Folder", self.library_panel._add_folder, "",
             "library", "import folder library")
         for i in range(self.tabs.count()):
@@ -706,6 +1055,132 @@ class MainWindow(QMainWindow):
         self.tasks.add_listener(self._on_task_event)
         self._annotations.add_listener(self._on_annotations_changed)
 
+    # ================================================================ nav history + goto
+    def _show_shortcuts(self) -> None:
+        """Open the keyboard-shortcuts cheat sheet (modal)."""
+        ShortcutsDialog(self).exec()
+
+    # -- user-pasted shortcut map -------------------------------------------
+    def _apply_shortcut_overrides(self, notify: bool = True) -> ShortcutReport:
+        """Rebind actions from the settings map and the overrides file.
+
+        The file wins over the stored setting so a pasted map never fights a
+        stale value, and built-in bindings are restored first, which makes
+        "delete the entry and reload" a real undo.
+        """
+        stored = self.settings.get("keyboard", "custom", {}) or {}
+        mapping = dict(stored) if isinstance(stored, dict) else {}
+        load = read_overrides()
+        mapping.update(load.mapping)
+
+        report = apply_overrides(self, mapping, source=str(load.path))
+        report.error = report.error or load.error
+        self.shortcut_report = report
+        if notify:
+            show_toast(self, report.summary(), self._override_toast_level(report))
+        return report
+
+    @staticmethod
+    def _override_toast_level(report: ShortcutReport) -> str:
+        if report.error or report.unknown or report.invalid or report.conflicts:
+            return "warning"
+        return "success"
+
+    def action_reload_shortcut_overrides(self) -> ShortcutReport:
+        """Re-read the paste target from disk and apply it immediately."""
+        return self._apply_shortcut_overrides(notify=True)
+
+    def action_reset_shortcut_overrides(self) -> None:
+        """Drop every override in memory (the file itself is left alone)."""
+        report = apply_overrides(self, {})
+        self.shortcut_report = report
+        show_toast(self, "Shortcuts reset to their defaults for this session",
+                   "info")
+
+    def action_edit_shortcuts_file(self) -> None:
+        """Create the paste target if needed and hand it to the desktop."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        target = overrides_path()
+        try:
+            write_template(target, actions=collect_actions(self))
+        except Exception as e:
+            show_toast(self, f"Could not create {target.name}: {e}", "warning")
+            return
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        if not opened:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.parent)))
+        show_toast(self,
+                   f"Edit {target.name}, save it, then Reload Shortcut Overrides",
+                   "info")
+
+    def _show_shortcuts_once(self) -> None:
+        """Auto-hint variant: same sheet, modeless so it never blocks."""
+        ShortcutsDialog(self).show()
+
+    def _nav_back(self) -> None:
+        view = self.current_view()
+        if view is not None and view.nav_back():
+            self._sync_ui_to_view()
+
+    def _nav_forward(self) -> None:
+        view = self.current_view()
+        if view is not None and view.nav_forward():
+            self._sync_ui_to_view()
+
+    # -- reading-experience handlers (#7, #8, #59) -----------------------------
+    def _toggle_autoscroll(self) -> None:
+        view = self.current_view()
+        if view is None or not hasattr(view, "toggle_autoscroll"):
+            self.act_autoscroll.setChecked(False)
+            return
+        view.toggle_autoscroll()
+        self.act_autoscroll.setChecked(view._autoscroll_timer.isActive())
+        state = "started" if self.act_autoscroll.isChecked() else "stopped"
+        show_toast(self, f"Autoscroll {state}", "info")
+
+    def _toggle_slideshow(self) -> None:
+        view = self.current_view()
+        if view is None or not hasattr(view, "start_slideshow"):
+            self.act_slideshow.setChecked(False)
+            return
+        if view.slideshow_active():
+            view.stop_slideshow()
+            self.act_slideshow.setChecked(False)
+            show_toast(self, "Slideshow stopped", "info")
+            return
+        interval, ok = QInputDialog.getDouble(
+            self, "Slideshow auto-advance",
+            "Seconds per page:", view._slideshow_interval, 0.5, 120.0, 1)
+        if not ok:
+            self.act_slideshow.setChecked(False)
+            return
+        view.start_slideshow(interval)
+        self.act_slideshow.setChecked(True)
+        show_toast(self, f"Slideshow: one page every {interval:g}s", "info")
+
+    def _toggle_rtl(self) -> None:
+        view = self.current_view()
+        if view is None or not hasattr(view, "set_rtl"):
+            self.act_rtl.setChecked(False)
+            return
+        view.set_rtl(not view.rtl())
+        self.act_rtl.setChecked(view.rtl())
+        show_toast(self, "Right-to-left mode "
+                   + ("on" if view.rtl() else "off"), "info")
+
+    def _update_reading_actions(self) -> None:
+        """Keep reading-mode checkboxes honest when the tab changes."""
+        view = self.current_view()
+        if view is not None and hasattr(view, "_autoscroll_timer"):
+            self.act_autoscroll.setChecked(view._autoscroll_timer.isActive())
+            self.act_slideshow.setChecked(view.slideshow_active())
+            self.act_rtl.setChecked(view.rtl())
+        else:
+            self.act_autoscroll.setChecked(False)
+            self.act_slideshow.setChecked(False)
+            self.act_rtl.setChecked(False)
     # ================================================================ document open/close
     def open_path(self, path: str, password: str = "") -> None:
         result = open_document(Path(path), password)
@@ -733,11 +1208,13 @@ class MainWindow(QMainWindow):
             if rec:
                 view.restore_state(rec)
         except Exception:
-            pass
+            logger.exception("open_path failed")
         view.state_changed.connect(self._sync_ui_to_view)
+        view.nav_state_changed.connect(self._update_nav_actions)
         view.content_changed.connect(self._on_content_changed)
         view.request_toast.connect(
             lambda msg, kind: show_toast(self, msg, kind))
+        self._wire_view_signals(view)
 
         existing = self.tabs.find_tab_by_path(str(path))
         if existing >= 0:
@@ -766,7 +1243,7 @@ class MainWindow(QMainWindow):
                     last_modified=Path(path).stat().st_mtime))
             self._library.mark_opened(str(path))
         except Exception:
-            pass
+            logger.exception("open_path failed")
 
         # PDF-specific sync: import native annotations; index text.
         if hasattr(view, "pdf"):
@@ -775,10 +1252,11 @@ class MainWindow(QMainWindow):
                 if imported:
                     self.annotations_panel.reload()
             except Exception:
-                pass
+                logger.exception("open_path failed")
         self._maybe_index(view)
         self._sync_ui_to_view()
         self._record_session()
+        self._begin_reading_session(view)
 
     def _tab_title(self, view: DocumentView) -> str:
         name = view.display_name
@@ -805,10 +1283,13 @@ class MainWindow(QMainWindow):
         view = self.tabs.widget(index)
         if view is None:
             return
-        if view.is_modified:
+        doc_views = self._document_views_in(view)
+        if any(v.is_modified for v in doc_views):
+            name = (view.display_name if isinstance(view, DocumentView)
+                    else self.tabs.tabText(index))
             box = QMessageBox(self)
             box.setWindowTitle("Unsaved changes")
-            box.setText(f"'{view.display_name}' has unsaved changes.")
+            box.setText(f"'{name}' has unsaved changes.")
             save_btn = box.addButton("Save", QMessageBox.AcceptRole)
             discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
             cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
@@ -819,10 +1300,12 @@ class MainWindow(QMainWindow):
             if clicked is save_btn:
                 if not self.action_save():
                     return
-        try:
-            view.close_view()
-        except Exception:
-            pass
+        self._end_reading_session()
+        for v in doc_views:
+            try:
+                v.close_view()
+            except Exception:
+                logger.exception("close_tab failed")
         self.tabs.removeTab(index)
         if self.tabs.count() == 0:
             self.tabs.hide()
@@ -830,6 +1313,31 @@ class MainWindow(QMainWindow):
             self._placeholder.show()
         self._sync_ui_to_view()
         self._record_session()
+
+    # -- reading-session lifecycle (feeds the reading summary's trends) ----
+    def _begin_reading_session(self, view) -> None:
+        """End any open session, then start one for the newly opened doc."""
+        self._end_reading_session()
+        try:
+            self._current_session_id = self._sessions.start(str(view.path))
+        except Exception:
+            self._current_session_id = None
+
+    def _end_reading_session(self) -> None:
+        """Close the open session with elapsed wall time and pages read.
+
+        Defensive throughout: a recording failure must never block closing a
+        tab or the app. Duplicate ends are harmless (id becomes None).
+        """
+        sid, self._current_session_id = self._current_session_id, None
+        if sid is None:
+            return
+        view = self.tabs.currentWidget()
+        pages = max(int(getattr(view, "current_page", 0) or 0) + 1, 1)
+        try:
+            self._sessions.end(sid, pages)
+        except Exception:
+            logger.exception("_end_reading_session failed")
 
     def reopen_path(self, path: str) -> None:
         if path:
@@ -845,11 +1353,13 @@ class MainWindow(QMainWindow):
         view = self.tabs.widget(index)
         if view is None:
             return
+        if not isinstance(view, DocumentView):
+            show_toast(self, "Only a document tab can be detached", "warning")
+            return
         path = str(getattr(view, "path", ""))
         title = self.tabs.tabText(index)
         state = view.save_state()
         self.tabs.removeTab(index)
-        self.tabs._remember_closed(index) if False else None
         sub = MainWindow(self.settings, self.db, self.tasks, self.journal)
         sub.setAttribute(Qt.WA_DeleteOnClose)
         sub.resize(1000, 720)
@@ -871,24 +1381,46 @@ class MainWindow(QMainWindow):
         view = self.current_view()
         if view is not None:
             path = str(view.path)
-            self.annotations_panel.set_document_filter(path)
+            self.annotations_panel.set_document_filter(path, view)
             self.bookmarks_panel.set_document(path)
             self.thumbnails_panel.set_view(view)
+            self._update_reading_actions()
+            try:
+                view.tool_changed.connect(self._on_tool_changed)
+                view.reading_tick.connect(self._on_reading_tick)
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+            self._on_tool_changed(getattr(view, "annotation_tool", lambda: "")())
             try:
                 self._progress.save(path, view.current_page,
                                     view.save_state().get("scroll", 0.0),
                                     view.zoom, getattr(view, "view_id", ""))
             except Exception:
-                pass
+                logger.exception("_on_tab_changed failed")
         self._sync_ui_to_view()
+
+    def _update_window_title(self, view) -> None:
+        """Track the active document (and unsaved marker) in the title bar."""
+        doc = str(getattr(view, "display_name", "")) if view is not None else ""
+        dirty = " *" if getattr(view, "is_modified", False) else ""
+        if doc:
+            self.setWindowTitle(f"{doc}{dirty} — {APP_NAME}")
+        else:
+            self.setWindowTitle(f"{APP_NAME} — {APP_TAGLINE}")
 
     def _sync_ui_to_view(self, *args) -> None:
         view = self.current_view()
+        self._update_window_title(view)
         if view is None:
             self._status_page.setText("No document")
             self._status_zoom.setText("")
             self._status_doc_state.setText("")
+            self._status_tool.setText("")
+            self._status_annots.setText("")
+            self._status_reading.setText("")
+            self._status_progress.setText("")
             return
+        self._apply_view_tuning_defaults(view)
         page = view.current_page
         total = view.page_count
         label = f"Page {page + 1} of {total}"
@@ -897,9 +1429,31 @@ class MainWindow(QMainWindow):
             if info and info.label:
                 label = f"Page {info.label} ({page + 1}/{total})"
         except Exception:
-            pass
+            logger.exception("_sync_ui_to_view failed")
         self._status_page.setText(label)
         self._status_zoom.setText(f"{int(view.zoom * 100)}%")
+        # Reading progress (#9).
+        if total > 0:
+            pct = int(round((page + 1) / total * 100))
+            self._status_progress.setText(f"{pct}% read")
+        else:
+            self._status_progress.setText("")
+        # Enhanced status segments (#81): annotation count + reading time.
+        try:
+            n = view.live_annotation_count()
+            self._status_annots.setText(f"{n} markup" + ("s" if n != 1 else ""))
+        except Exception:
+            self._status_annots.setText("")
+        secs = getattr(view, "reading_seconds", lambda: 0)()
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        self._status_reading.setText(
+            f"{h}:{m:02d}:{s:02d}" if h else f"{m}m {s:02d}s")
+        # Keep the go-to-page box and Back/Forward in sync.
+        self._update_nav_actions()
+        if hasattr(self, "_goto_box"):
+            self._goto_box.setPlaceholderText(
+                f"1–{total}" if total > 0 else "Page")
         self._status_doc_state.setText(
             "● Unsaved changes" if view.is_modified else "")
         # Update progress in library.
@@ -907,9 +1461,38 @@ class MainWindow(QMainWindow):
             try:
                 self._library.set_progress(str(view.path), (page + 1) / total)
             except Exception:
-                pass
+                logger.exception("_sync_ui_to_view failed")
         self.thumbnails_panel.highlight(page)
         self._update_tab_title()
+
+    def _update_nav_actions(self) -> None:
+        """Enable/disable Back/Forward based on the current view's history."""
+        view = self.current_view()
+        has_back = bool(view and view.nav_can_back())
+        has_fwd = bool(view and view.nav_can_forward())
+        self.act_nav_back.setEnabled(has_back)
+        self.act_nav_forward.setEnabled(has_fwd)
+
+    def _on_tool_changed(self, tool: str) -> None:
+        """Reflect the active annotation tool in the status bar (#81)."""
+        labels = {"": "", "highlight": "Highlight", "underline": "Underline",
+                  "strikeout": "Strikeout", "squiggly": "Squiggly",
+                  "note": "Sticky note", "ink": "Ink", "rectangle": "Rectangle",
+                  "ellipse": "Ellipse", "arrow": "Arrow", "freetext": "Text box",
+                  "stamp": "Stamp", "eraser": "Eraser", "redact": "Redaction"}
+        self._status_tool.setText(labels.get(tool, tool))
+
+    def _on_reading_tick(self, seconds: int) -> None:
+        """Update the reading-time status segment once per second (#81)."""
+        view = self.current_view()
+        if view is None or not hasattr(view, "reading_seconds"):
+            return
+        if self.sender() is not view._reading_timer:
+            return  # a background tab ticked; only show the active tab's time
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        self._status_reading.setText(
+            f"{h}:{m:02d}:{s:02d}" if h else f"{m}m {s:02d}s")
 
     def _update_tab_title(self) -> None:
         idx = self.tabs.currentIndex()
@@ -920,6 +1503,21 @@ class MainWindow(QMainWindow):
     def _on_content_changed(self) -> None:
         self._update_tab_title()
         self._sync_ui_to_view()
+        # Live-refresh the annotations panel (roadmap #15) — debounced inside
+        # the panel, so sticky-note keystrokes don't rebuild the list.
+        self.annotations_panel.refresh_live()
+
+    def _wire_view_signals(self, view) -> None:
+        """Attach action_toast (#82) to freshly created or restored views."""
+        if view is None or not hasattr(view, "action_toast"):
+            return
+        wired = getattr(self, "_toast_wired", None)
+        if wired is None:
+            wired = self._toast_wired = set()
+        if id(view) in wired:
+            return
+        wired.add(id(view))
+        view.action_toast.connect(self._on_action_toast)
 
     def _on_annotations_changed(self, doc_path: str) -> None:
         self.annotations_panel.reload()
@@ -928,6 +1526,50 @@ class MainWindow(QMainWindow):
         view = self.current_view()
         if view is not None:
             view.go_to_page(page)
+            self._sync_ui_to_view()
+
+    def _flash_annotation_on_page(self, data: dict) -> None:
+        """Panel asked to highlight a live annotation on its page (#15 polish)."""
+        view = self.current_view()
+        if view is None or not hasattr(view, "flash_annotation"):
+            return
+        if str(view.path) != data.get("path"):
+            # Wrong tab focused; just jump to the page instead.
+            self._goto_page(int(data.get("page", 0)))
+            return
+        view.flash_annotation(int(data.get("page", 0)),
+                              data.get("rect") or [0, 0, 0, 0],
+                              sticky=bool(data.get("sticky")))
+
+    def _goto_box_commit(self) -> None:
+        """Jump to the page typed into the go-to-page toolbar box."""
+        text = self._goto_box.text().strip()
+        if not text:
+            return
+        view = self.current_view()
+        if view is None or view.page_count <= 0:
+            self._goto_box.clear()
+            return
+        try:
+            page = int(text) - 1  # toolbar box is 1-based like the status bar
+        except ValueError:
+            self._goto_box.clear()
+            return
+        view.go_to_page(max(0, min(page, view.page_count - 1)))
+        self._goto_box.clear()
+        self._sync_ui_to_view()
+
+    def _goto_page_dialog(self) -> None:
+        """Ctrl+G 'Go to page…' prompt."""
+        view = self.current_view()
+        if view is None or view.page_count <= 0:
+            return
+        page, ok = QInputDialog.getInt(
+            self, "Go to page",
+            f"Page number (1-{view.page_count}):",
+            view.current_page + 1, 1, view.page_count)
+        if ok:
+            view.go_to_page(page - 1)
             self._sync_ui_to_view()
 
     def _goto_page_scroll(self, page: int, scroll: float) -> None:
@@ -1100,12 +1742,45 @@ class MainWindow(QMainWindow):
         view = self.current_view()
         if view is None:
             return
-        widget = view.focusWidget() if hasattr(view, "focusWidget") else None
-        from PySide6.QtGui import QUndoStack
-        # Route to focused text widget undo when available; else view-level.
+        # Annotation/note undo on PDF views; falls back to focused-widget undo
+        # (e.g. text editing inside a form field or note) first.
         focused = QApplication.focusObject()
-        if hasattr(focused, "undo"):
-            focused.undo()
+        if focused is not None and hasattr(focused, "undo") and \
+                hasattr(focused, "hasAcceptableInput"):
+            try:
+                focused.undo()
+                return
+            except Exception:
+                logger.exception("action_undo failed")
+        if hasattr(view, "can_undo") and view.can_undo():
+            view.undo()
+            return
+        if focused is not None and hasattr(focused, "undo"):
+            try:
+                focused.undo()
+            except Exception:
+                logger.exception("action_undo failed")
+
+    def action_redo(self) -> None:
+        view = self.current_view()
+        if view is None:
+            return
+        focused = QApplication.focusObject()
+        if focused is not None and hasattr(focused, "redo") and \
+                hasattr(focused, "hasAcceptableInput"):
+            try:
+                focused.redo()
+                return
+            except Exception:
+                logger.exception("action_redo failed")
+        if hasattr(view, "can_redo") and view.can_redo():
+            view.redo()
+            return
+        if focused is not None and hasattr(focused, "redo"):
+            try:
+                focused.redo()
+            except Exception:
+                logger.exception("action_redo failed")
 
     def action_redo(self) -> None:
         focused = QApplication.focusObject()
@@ -1152,10 +1827,49 @@ class MainWindow(QMainWindow):
         view = self.current_view()
         if view is not None and hasattr(view, "set_annotation_tool"):
             view.set_annotation_tool(tool)
+            # Show the annotation style palette whenever an annotation tool is
+            # active; create-once, reuse thereafter.
+            if not hasattr(view, "_annot_palette") or view._annot_palette is None:
+                from veyrion_workspace.ui.views.pdf_view import (
+                    AnnotationStylePalette)
+                view._annot_palette = AnnotationStylePalette(self)
+                view._annot_palette.style_changed.connect(
+                    lambda c, o, w: view.set_annotation_style(
+                        color=c, opacity=o, width=w))
+            palette = view._annot_palette
+            if tool and tool != "eraser":
+                # Position palette at top-right of the view's viewport.
+                vp = view._view.viewport()
+                parent_global = vp.mapToGlobal(QPoint(0, 0))
+                palette.move(parent_global + QPoint(
+                    max(0, vp.width() - palette.width() - 6),
+                    max(0, vp.height() - palette.height() - 6)))
+                palette.show()
+                palette.raise_()
+                palette.activateWindow()
+            else:
+                palette.hide()
+        else:
+            # Deselect tool: hide any attached palette.
+            if view is not None and getattr(view, "_annot_palette", None):
+                view._annot_palette.hide()
         for t, btn in self._tool_buttons.items():
             btn.setChecked(t == tool)
         if tool:
             show_toast(self, f"Tool: {tool} — drag on the page", "info")
+
+    def _select_all_annotations(self) -> None:
+        """Select every annotation on the current page (Phase 2 editing)."""
+        view = self.current_view()
+        if view is None or not hasattr(view, "select_all_on_page"):
+            return
+        view.set_annotation_tool("")
+        count = view.select_all_on_page(view.current_page)
+        if count:
+            show_toast(self, f"{count} annotation(s) selected — drag to move, "
+                             "right-click to restyle", "info")
+        else:
+            show_toast(self, "No annotations on this page", "warning")
 
     def _rotate_page_right(self) -> None:
         view = self.current_view()
@@ -1287,9 +2001,8 @@ class MainWindow(QMainWindow):
                        "warning")
             return
         views = []
-        for i in range(self.tabs.count()):
-            v = self.tabs.widget(i)
-            if v is not None and not v.is_modified:
+        for v in self._all_document_views():
+            if not v.is_modified:
                 views.append(v)
         if not views:
             views = [current]
@@ -1505,6 +2218,13 @@ class MainWindow(QMainWindow):
             "Splitting PDF", "split", view.pdf.split_at, ranges,
             Path(out_dir), view.path.stem)
 
+    def action_reading_summary(self) -> None:
+        """Open the reading report for the active document."""
+        from veyrion_workspace.ui.reading_summary import ReadingSummaryDialog
+
+        view = self.current_view()
+        ReadingSummaryDialog(self, view=view, db=self.db).exec()
+
     def action_focus_mode(self) -> None:
         self._focus_mode = not self._focus_mode
         for dock in (self.dock_library, self.dock_thumbs, self.dock_toc,
@@ -1517,12 +2237,145 @@ class MainWindow(QMainWindow):
             else:
                 if getattr(dock, "_or_was_visible", False):
                     dock.show()
-        self.toolbar().setVisible(not self._focus_mode)
+        self.main_toolbar.setVisible(not self._focus_mode)
         self.menuBar().setVisible(not self._focus_mode)
         self.statusBar().setVisible(not self._focus_mode)
         self.act_focus.setChecked(self._focus_mode)
         if self._focus_mode:
             show_toast(self, "Focus mode — press F9 to exit", "info")
+
+    # -- distraction-free mode (#79) ---------------------------------------
+    def action_distraction_free(self) -> None:
+        """Fade out ALL chrome — toolbar, menus, status bar, docks, nav rail.
+
+        Unlike focus mode, this is remembered per session and the nav rail
+        hides too. Press F8 again to restore.
+        """
+        on = not bool(self.settings.get("reading", "distraction_free", False))
+        self.settings.set("reading", "distraction_free", on)
+        self._apply_distraction_free(on)
+        self.act_distraction.setChecked(on)
+        if on:
+            show_toast(self, "Distraction-free — press F8 to restore", "info")
+
+    def _apply_distraction_free(self, on: bool) -> None:
+        rail = getattr(self, "nav_rail", None)
+        if on:
+            self._chrome_was_visible = {
+                "toolbar": self.main_toolbar.isVisible(),
+                "menubar": self.menuBar().isVisible(),
+                "statusbar": self.statusBar().isVisible(),
+                "nav_rail": bool(rail is not None and rail.isVisible()),
+                "docks": [d.isVisible() for d in self._all_docks()],
+            }
+            self.main_toolbar.hide()
+            self.menuBar().hide()
+            self.statusBar().hide()
+            if rail is not None:
+                rail.hide()
+            for d in self._all_docks():
+                d.hide()
+        else:
+            was = getattr(self, "_chrome_was_visible", None)
+            if was:
+                if was.get("toolbar"):
+                    self.main_toolbar.show()
+                if was.get("menubar"):
+                    self.menuBar().show()
+                if was.get("statusbar"):
+                    self.statusBar().show()
+                if was.get("nav_rail") and rail is not None:
+                    rail.show()
+                for d, vis in zip(self._all_docks(), was.get("docks", [])):
+                    if vis:
+                        d.show()
+            else:
+                self.main_toolbar.show()
+                self.menuBar().show()
+                self.statusBar().show()
+                if rail is not None:
+                    rail.show()
+
+    def _all_docks(self) -> list:
+        return [self.dock_library, self.dock_thumbs, self.dock_toc,
+                self.dock_bookmarks, self.dock_annotations, self.dock_notes,
+                self.dock_search, self.dock_tasks, self.dock_props]
+
+    # -- per-view theme (#77) + spread gap tuning (#10) ---------------------
+    def _set_view_theme(self, key: str) -> None:
+        from veyrion_workspace.ui.views.pdf_view import PdfView
+        view = self.current_view()
+        if not isinstance(view, PdfView):
+            if view is not None:
+                show_toast(self, "Page themes apply to PDF documents", "warning")
+            return
+        view.set_theme(key)
+        self.settings.set("reading", "pdf_theme", key)
+        self._sync_theme_actions(view)
+
+    def _sync_theme_actions(self, view: PdfView) -> None:
+        for a in self.act_themes:
+            a.setChecked(a.data() == view.theme())
+
+    def _gap_tuning_dialog(self) -> None:
+        from veyrion_workspace.ui.views.pdf_view import PdfView
+        view = self.current_view()
+        if not isinstance(view, PdfView):
+            show_toast(self, "Spread tuning applies to PDF documents", "warning")
+            return
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QDoubleSpinBox,
+                                       QFormLayout, QCheckBox, QVBoxLayout)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Spread tuning")
+        form = QFormLayout()
+        gap = QDoubleSpinBox()
+        gap.setRange(0.0, 120.0)
+        gap.setSingleStep(2.0)
+        gap.setDecimals(1)
+        gap.setSuffix(" pt")
+        gap.setValue(view.gap())
+        form.addRow("Gap between pages", gap)
+        cover = QCheckBox("Offset first page (book cover layout)")
+        cover.setChecked(view.cover_offset())
+        form.addRow("", cover)
+        lay = QVBoxLayout(dlg)
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+        if dlg.exec() == QDialog.Accepted:
+            view.set_gap(float(gap.value()))
+            if bool(cover.isChecked()) != view.cover_offset():
+                view.set_cover_offset(bool(cover.isChecked()))
+            self.settings.set("reading", "pdf_gap", float(view.gap()))
+            self.settings.set("reading", "pdf_cover_offset", view.cover_offset())
+
+    def _on_action_toast(self, message: str, kind: str, action) -> None:
+        """Route view deletion confirmations to an Undo-button toast (#82)."""
+        show_actionable_toast(self, message, kind, on_action=action,
+                              action_text="Undo")
+
+    def _apply_view_tuning_defaults(self, view) -> None:
+        """Apply persisted spread/theme defaults to a PDF view once (#10/#77).
+
+        Views that restored an explicit gap/theme from reading progress keep
+        it; untouched views pick up the global defaults.
+        """
+        from veyrion_workspace.ui.views.pdf_view import PdfView
+        if not isinstance(view, PdfView) or getattr(view, "_tuning_applied", False):
+            return
+        view._tuning_applied = True
+        try:
+            gap = float(self.settings.get("reading", "pdf_gap", 14) or 14)
+        except (TypeError, ValueError):
+            gap = 14.0
+        if abs(view.gap() - 14.0) <= 0.01 and abs(gap - 14.0) > 0.01:
+            view.set_gap(gap)
+        theme = str(self.settings.get("reading", "pdf_theme", "") or "")
+        if view.theme() == "" and theme:
+            view.set_theme(theme)
+        self._sync_theme_actions(view)
 
     def action_presentation(self) -> None:
         view = self.current_view()
@@ -1624,8 +2477,7 @@ class MainWindow(QMainWindow):
     def _record_session(self) -> None:
         tabs = []
         for i in range(self.tabs.count()):
-            view = self.tabs.widget(i)
-            if view is not None:
+            for view in self._document_views_in(self.tabs.widget(i)):
                 try:
                     tabs.append({"path": str(view.path), "state": view.save_state()})
                 except Exception:
@@ -1689,9 +2541,9 @@ class MainWindow(QMainWindow):
         # Autosave unsaved docs is intentionally NOT silent; ask per doc.
         modified = []
         for i in range(self.tabs.count()):
-            view = self.tabs.widget(i)
-            if view is not None and view.is_modified:
-                modified.append((i, view))
+            for view in self._document_views_in(self.tabs.widget(i)):
+                if view.is_modified:
+                    modified.append((i, view))
         if modified:
             box = QMessageBox(self)
             box.setWindowTitle("Unsaved changes")
@@ -1710,14 +2562,16 @@ class MainWindow(QMainWindow):
                     if not self.action_save():
                         event.ignore()
                         return
+        self._end_reading_session()
         self._record_session()
         self.journal.mark_clean_exit()
         self._save_window_state()
         # Close engines.
-        for i in range(self.tabs.count()):
-            view = self.tabs.widget(i)
-            if view is not None:
+        for view in self._all_document_views():
+            try:
                 view.close_view()
+            except Exception:
+                logger.exception("closeEvent failed")
         self.tasks.shutdown(wait=False)
         event.accept()
 

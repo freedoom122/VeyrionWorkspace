@@ -208,12 +208,8 @@ def run(argv: list | None = None) -> int:
             continue
         window.open_path(arg)
 
-    # Autosave journal maintenance.
-    from PySide6.QtCore import QTimer
-    journal_timer = QTimer()
-    journal_timer.setInterval(30_000)
-    journal_timer.timeout.connect(window._record_session)
-    journal_timer.start()
+    # (The crash-journal heartbeat lives on the MainWindow itself, parented
+    # to it, so no orphan timer is created here.)
 
     # Clean temp files from previous runs.
     try:

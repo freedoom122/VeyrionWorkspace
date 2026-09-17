@@ -28,14 +28,22 @@ class DocumentView(QWidget):
     content_changed = Signal()
     # Emitted to show transient feedback in the main window.
     request_toast = Signal(str, str)  # message, kind
+    # Emitted when back/forward navigation availability changes.
+    nav_state_changed = Signal()
 
     view_id: str = "base"
+
+    NAV_HISTORY_MAX = 100
 
     def __init__(self, engine: DocumentEngine, parent=None) -> None:
         super().__init__(parent)
         self.engine = engine
         self._current_page = 0
         self._zoom = 1.0
+        # Reading history (browser-style back/forward over page jumps).
+        self._nav_back: list[int] = []
+        self._nav_forward: list[int] = []
+        self._nav_programmatic = False
 
     # -- identity -----------------------------------------------------------
     @property
@@ -71,19 +79,62 @@ class DocumentView(QWidget):
         except Exception:
             return 0
 
-    def go_to_page(self, index: int) -> bool:
+    def go_to_page(self, index: int, *, _record: bool = True) -> bool:
         index = max(0, min(self.page_count - 1, index))
         if index != self._current_page:
+            if _record and not self._nav_programmatic:
+                self._nav_back.append(self._current_page)
+                if len(self._nav_back) > self.NAV_HISTORY_MAX:
+                    self._nav_back.pop(0)
+                self._nav_forward.clear()
+                self.nav_state_changed.emit()
             self._current_page = index
             self.state_changed.emit()
             return True
         return False
 
+    # -- reading history (browser-style back/forward) -------------------------
+    def nav_back(self) -> bool:
+        """Return to the previous page in the jump history."""
+        if not self._nav_back:
+            return False
+        prev = self._nav_back.pop()
+        self._nav_forward.append(self._current_page)
+        self._nav_programmatic = True
+        try:
+            self.go_to_page(prev, _record=False)
+        finally:
+            self._nav_programmatic = False
+        self.nav_state_changed.emit()
+        return True
+
+    def nav_forward(self) -> bool:
+        """Re-apply the next page in the jump history."""
+        if not self._nav_forward:
+            return False
+        nxt = self._nav_forward.pop()
+        self._nav_back.append(self._current_page)
+        self._nav_programmatic = True
+        try:
+            self.go_to_page(nxt, _record=False)
+        finally:
+            self._nav_programmatic = False
+        self.nav_state_changed.emit()
+        return True
+
+    def nav_can_back(self) -> bool:
+        return bool(self._nav_back)
+
+    def nav_can_forward(self) -> bool:
+        return bool(self._nav_forward)
+
     def next_page(self) -> bool:
-        return self.go_to_page(self._current_page + 1)
+        # Sequential paging is not a "jump"; don't pollute history.
+        return self.go_to_page(self._current_page + 1, _record=False)
 
     def previous_page(self) -> bool:
-        return self.go_to_page(self._current_page - 1)
+        # Sequential paging is not a "jump"; don't pollute history.
+        return self.go_to_page(self._current_page - 1, _record=False)
 
     # -- zoom ---------------------------------------------------------------
     @property
