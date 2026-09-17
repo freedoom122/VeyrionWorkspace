@@ -134,14 +134,14 @@ class TtsReader:
                 if self._engine is not None:
                     self._engine.stop()
             except Exception:
-                pass
+                logger.exception("stop failed")
         self._queue = queue.Queue()
 
     def next_sentence(self) -> None:
         try:
             self._queue.put((self._skip_token(), ""))
         except Exception:
-            pass
+            logger.exception("next_sentence failed")
 
     def _skip_token(self):
         return ("__skip__",)
@@ -186,7 +186,7 @@ class TtsReader:
                 try:
                     self.on_sentence(idx, sentence)
                 except Exception:
-                    pass
+                    logger.exception("_loop failed")
             # Wait until playing.
             while self._playing.is_set() is False and not self._stopped.is_set():
                 threading.Event().wait(0.1)
@@ -203,7 +203,7 @@ class TtsReader:
             try:
                 self.on_end()
             except Exception:
-                pass
+                logger.exception("_loop failed")
 
     @property
     def current_index(self) -> int:
@@ -219,4 +219,4 @@ class TtsReader:
             if self._engine is not None:
                 self._engine.stop()
         except Exception:
-            pass
+            logger.exception("shutdown failed")

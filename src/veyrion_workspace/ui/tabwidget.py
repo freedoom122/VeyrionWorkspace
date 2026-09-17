@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QMenu, QTabBar, QTabWidget, QVBoxLayout, QWidget,
@@ -36,12 +36,31 @@ class DocumentTabWidget(QTabWidget):
         bar = self.tabBar()
         bar.setContextMenuPolicy(Qt.CustomContextMenu)
         bar.customContextMenuRequested.connect(self._context_menu)
-        bar.tabBarDoubleClicked = getattr(bar, 'tabBarDoubleClicked', None)
-        if hasattr(bar, 'tabBarDoubleClicked'):
-            bar.tabBarDoubleClicked.connect(
-                lambda idx: self.tab_detach_requested.emit(idx))
+        bar.tabBarDoubleClicked.connect(self._on_tab_double_clicked)
         self.tabCloseRequested.connect(self._on_close_requested)
+        bar.installEventFilter(self)   # middle-click close on a tab
         self._closed_stack: list[tuple[str, dict]] = []
+
+    # -- event filter ------------------------------------------------------
+    def _on_tab_double_clicked(self, index: int) -> None:
+        """Detach on a tab; on the empty strip, open a document."""
+        if index >= 0:
+            self.tab_detach_requested.emit(index)
+            return
+        opener = getattr(self.window(), "action_open", None)
+        if opener is not None:
+            opener()
+
+    def eventFilter(self, obj, ev) -> bool:
+        """Middle-click on a tab closes it (browser convention)."""
+        if (obj is self.tabBar()
+                and ev.type() == QEvent.MouseButtonPress
+                and ev.button() == Qt.MiddleButton):
+            idx = self.tabBar().tabAt(ev.position().toPoint())
+            if idx >= 0:
+                self._on_close_requested(idx)
+                return True
+        return super().eventFilter(obj, ev)
 
     # -- helpers -----------------------------------------------------------
     def find_tab_by_path(self, path: str) -> int:
@@ -91,6 +110,7 @@ class DocumentTabWidget(QTabWidget):
         bar = self.tabBar()
         index = bar.tabAt(pos)
         if index < 0:
+            self._empty_area_menu(pos)
             return
         menu = QMenu(self)
         pin = menu.addAction("Pin tab" if not self.pin_state(index) else "Unpin tab")
@@ -124,3 +144,25 @@ class DocumentTabWidget(QTabWidget):
                 if not self.pin_state(i):
                     self._remember_closed(i)
                     self.tab_close_requested.emit(i)
+
+    def _empty_area_menu(self, pos) -> None:
+        """Right-click on the tab-bar's empty strip: open / reopen actions."""
+        bar = self.tabBar()
+        menu = QMenu(self)
+        open_act = menu.addAction("Open document…")
+        reopen = (menu.addAction("Reopen closed tab")
+                  if self._closed_stack else None)
+        chosen = menu.exec(bar.mapToGlobal(pos))
+        if chosen is None:
+            return
+        wnd = self.window()
+        if chosen is open_act:
+            opener = getattr(wnd, "action_open", None)
+            if opener is not None:
+                opener()
+        elif reopen is not None and chosen is reopen:
+            item = self.pop_last_closed()
+            if item:
+                reopen_fn = getattr(wnd, "reopen_path", None)
+                if reopen_fn is not None:
+                    reopen_fn(item[0])

@@ -74,6 +74,9 @@ class CommandPalette(QFrame):
 
         self._list = QListWidget()
         self._list.setObjectName("paletteList")
+        # Backwards-compatible aliases used by scripts and tests.
+        self.search = self._input
+        self.list = self._list
         self._list.itemActivated.connect(self._run_item)
         self._list.itemClicked.connect(self._run_item)
         lay.addWidget(self._list)
@@ -87,6 +90,7 @@ class CommandPalette(QFrame):
         self._commands = commands
 
     def open_palette(self) -> None:
+        """Show the palette overlay and focus its input."""
         self._input.clear()
         self._filter("")
         parent = self.parentWidget()
@@ -98,6 +102,7 @@ class CommandPalette(QFrame):
         self._input.setFocus()
 
     def close_palette(self) -> None:
+        """Hide the palette overlay."""
         self.hide()
         parent = self.parentWidget()
         if parent:

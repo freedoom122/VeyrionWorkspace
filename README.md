@@ -160,7 +160,17 @@ CSV → PDF; DOCX → Markdown; annotations → Markdown/HTML/CSV/JSON/PDF.
 | `PgUp`/`PgDn`   | Page navigation              |
 | `j`/`k`, `gg`, `G` | Vim-style navigation (Settings → Keyboard, opt-in) |
 
-All shortcuts are customizable in Settings → Keyboard.
+Press `F1` for the live cheat sheet of every action and its key, exportable as
+a printable PDF card, a CSV table, or a Markdown table for pasting into docs —
+or copied straight to the clipboard as Markdown, and printable — with a preview
+of the exact card before anything is sent. The
+annotations list, the reading summary (click the progress segment in the status
+bar) and the library's document selection export, copy and print the same way.
+To remap anything, paste a JSON key map into
+`shortcuts.json` (Settings → Edit Shortcut Overrides File…) and pick Settings →
+Reload Shortcut Overrides — the cheat sheet updates to match, unknown ids and
+unreadable keys are reported, and deleting an entry restores the built-in key.
+Vim-style navigation stays a toggle in Settings → Keyboard.
 
 ## Architecture
 

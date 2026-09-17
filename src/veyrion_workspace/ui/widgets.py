@@ -12,6 +12,9 @@ from PySide6.QtWidgets import (
     QAbstractButton, QFrame, QHBoxLayout, QLabel, QLayout, QPushButton,
     QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
+import logging
+
+logger = logging.getLogger("veyrion.widgets")
 
 from veyrion_workspace.ui.icons import icon, pixmap
 from veyrion_workspace.ui.theme import Palette
@@ -216,6 +219,72 @@ class EmptyState(QWidget):
         lay.addStretch(1)
 
 
+class ActionableToast(QFrame):
+    """Toast with an action button (roadmap #82): "Annotation deleted [Undo]".
+
+    The action button appears only when an ``on_action`` callback is given.
+    The toast dismisses itself after ``duration_ms``; invoking the action
+    cancels the dismissal timer first, so the callback runs cleanly.
+    """
+
+    KIND_STYLES = {
+        "info": ("#3E7C4F", "info"),
+        "success": ("#3E7C4F", "info"),
+        "warning": ("#B07A21", "warning"),
+        "error": ("#A33B2E", "warning"),
+    }
+
+    def __init__(self, parent: QWidget, message: str, kind: str = "info",
+                 duration_ms: int = 6000, on_action=None,
+                 action_text: str = "Undo") -> None:
+        super().__init__(parent)
+        color, icon_name = self.KIND_STYLES.get(kind, self.KIND_STYLES["info"])
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 9, 14, 9)
+        lay.setSpacing(8)
+        ic = QLabel()
+        ic.setPixmap(pixmap(icon_name, "#FFFFFF", 16))
+        lay.addWidget(ic)
+        label = QLabel(message)
+        label.setStyleSheet("color: #FFFFFF; font-weight: 500;")
+        label.setWordWrap(True)
+        lay.addWidget(label)
+        self._button = None
+        if on_action is not None:
+            self._button = QPushButton(action_text)
+            self._button.setCursor(Qt.PointingHandCursor)
+            self._button.setStyleSheet(
+                "QPushButton { background: rgba(255,255,255,0.18);"
+                " color: #FFFFFF; border: 1px solid rgba(255,255,255,0.55);"
+                " border-radius: 4px; padding: 2px 12px; font-weight: 600; }"
+                "QPushButton:hover { background: rgba(255,255,255,0.32); }")
+            self._button.clicked.connect(self._on_action_clicked)
+            lay.addWidget(self._button)
+        self.setStyleSheet(f"background: {color}; border-radius: 6px;")
+        self._on_action = on_action
+        self._dismiss_timer = QTimer(self)
+        self._dismiss_timer.setSingleShot(True)
+        self._dismiss_timer.timeout.connect(self.deleteLater)
+        self._dismiss_timer.start(duration_ms)
+        self.adjustSize()
+        self.show()
+        self.raise_()
+
+    def _on_action_clicked(self) -> None:
+        self._dismiss_timer.stop()
+        cb = self._on_action
+        try:
+            if cb is not None:
+                cb()
+        except Exception:
+            logger.exception("toast action failed")
+        self.deleteLater()
+
+    def reposition(self, parent_size) -> None:
+        self.move((parent_size.width() - self.width()) // 2,
+                  parent_size.height() - self.height() - 44)
+
+
 class Toast(QWidget):
     """Transient notification toast, rendered inside the main window."""
 
@@ -288,6 +357,22 @@ class HelpLabel(QLabel):
         self.setWordWrap(True)
 
 
+class ClickableLabel(QLabel):
+    """A QLabel that emits ``clicked`` — used by the status-bar segments."""
+
+    clicked = Signal()
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton \
+                and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 def show_toast(parent: QWidget, message: str, kind: str = "info") -> None:
     """Attach and position a toast over ``parent`` (usually main window)."""
     toast = Toast(parent, message, kind)
@@ -298,3 +383,15 @@ def show_toast(parent: QWidget, message: str, kind: str = "info") -> None:
 
 
 _PARENT_TOASTS: dict[QWidget, list] = {}
+
+
+def show_actionable_toast(parent: QWidget, message: str, kind: str = "info",
+                          on_action=None, action_text: str = "Undo",
+                          duration_ms: int = 6000) -> None:
+    """Toast with an action button, e.g. 'Annotation deleted [Undo]' (#82)."""
+    toast = ActionableToast(parent, message, kind, duration_ms,
+                            on_action=on_action, action_text=action_text)
+    toast.reposition(parent.size())
+    if parent not in _PARENT_TOASTS:
+        _PARENT_TOASTS[parent] = []
+    _PARENT_TOASTS[parent].append(toast)

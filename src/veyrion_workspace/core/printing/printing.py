@@ -8,7 +8,11 @@ this module provides the layout engine.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger("veyrion.printing")
@@ -79,28 +83,79 @@ def build_print_pdf(engine, out_path: Path, pages: list[int], *,
     return Path(out_path)
 
 
+class PrinterNameError(ValueError):
+    """A printer name that could never be a valid CUPS/Windows queue."""
+
+
+def validate_printer_name(name: str) -> str:
+    """Reject strings that cannot be a real queue name.
+
+    CUPS queue names and Windows shares must be non-empty, one line, and
+    cannot contain control characters or shell-hostile separators. Returns
+    the stripped name; raises :class:`PrinterNameError` otherwise.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise PrinterNameError("printer name is empty")
+    if len(name) > 128:
+        raise PrinterNameError("printer name is too long")
+    forbidden = set("\r\n\t\x00\f\v") | set("|;&$<>`\\'\"")
+    bad = sorted({c for c in name if c in forbidden})
+    if bad:
+        raise PrinterNameError(
+            "printer name contains forbidden characters: " + repr("".join(bad)))
+    return name
+
+
+def build_lp_command(pdf_path: Path, printer_name: str = "") -> list[str]:
+    """Argument vector for the platform ``lp`` command (macOS/Linux).
+
+    Always a list so paths and printer names containing spaces survive
+    intact -- never join into a shell string.
+    """
+    cmd = ["lp"]
+    if printer_name:
+        cmd += ["-d", validate_printer_name(printer_name)]
+    cmd.append(str(pdf_path))
+    return cmd
+
+
 def send_to_printer(pdf_path: Path, printer_name: str = "") -> bool:
-    """Platform print hand-off. Returns True when a print job was started."""
+    """Platform print hand-off. Returns True when a print job was started.
+
+    On Windows the spool file (an ``os.handleSubmit``-style temp copy when a
+    handle is used) is removed once the shell accepts it; on macOS/Linux the
+    ``lp`` process cleans up after itself, so only our own temp artifacts
+    are tracked here.
+    """
+    tmp_to_cleanup: Path | None = None
     try:
+        if printer_name:
+            printer_name = validate_printer_name(printer_name)
         if sys.platform.startswith("win"):
             import win32print
             import win32api
             name = printer_name or win32print.GetDefaultPrinter()
+            # Copy to a temp file so ShellExecute's async print consumes a
+            # file we own and can clean up deterministically.
+            tmp = Path(tempfile.gettempdir()) / f"veyrion_print_{os.getpid()}_{pdf_path.name}"
+            shutil.copy2(pdf_path, tmp)
+            tmp_to_cleanup = tmp
             win32api.ShellExecute(
-                0, "print", str(pdf_path), f'/d:"{name}"', ".", 0)
+                0, "print", str(tmp), f'/d:"{name}"', ".", 0)
             return True
-        if sys.platform == "darwin":
-            import subprocess
-            cmd = ["lp"] + ([f"-d {printer_name}"] if printer_name else []) + [str(pdf_path)]
-            subprocess.run(" ".join(cmd), shell=True, check=True)
-            return True
-        import subprocess
-        cmd = ["lp", "-d", printer_name, str(pdf_path)] if printer_name else ["lp", str(pdf_path)]
+        cmd = build_lp_command(pdf_path, printer_name)
         subprocess.run(cmd, check=True)
         return True
     except Exception as e:
         logger.error("print failed: %s", e)
         return False
+    finally:
+        if tmp_to_cleanup is not None:
+            try:
+                tmp_to_cleanup.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("could not remove print spool temp %s", tmp_to_cleanup)
 
 
 def list_printers() -> list[str]:

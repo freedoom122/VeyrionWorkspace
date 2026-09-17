@@ -32,3 +32,5 @@ appdata/
 # OS noise
 Thumbs.db
 .DS_Store
+# Generated sweep reports (rebuild with scripts/feature_sweep.py)
+artifacts/feature_sweep/

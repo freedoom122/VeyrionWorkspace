@@ -58,14 +58,24 @@ class AnnotationService:
                 logger.exception("annotation listener failed")
 
     # -- queries ------------------------------------------------------------
+    @staticmethod
+    def _norm_path(doc_path: str) -> str:
+        """Canonical DB key form: forward slashes.
+
+        Records are created from user paths (backslashes on Windows) but
+        looked up from engine paths (fitz gives POSIX form). Without
+        normalization one of the two lookups silently finds nothing.
+        """
+        return str(doc_path).replace("\\", "/")
+
     def for_document(self, doc_path: str) -> list[AnnotationRecord]:
-        return self._repo.for_document(doc_path)
+        return self._repo.for_document(self._norm_path(doc_path))
 
     def all_annotations(self) -> list[AnnotationRecord]:
         return self._repo.all()
 
     def count_for_document(self, doc_path: str) -> int:
-        return self._repo.count_for_document(doc_path)
+        return self._repo.count_for_document(self._norm_path(doc_path))
 
     # -- create / update / delete -------------------------------------------
     def create(self, doc_path: str, page: int, atype: str, *, rect: Any = None,
@@ -76,7 +86,7 @@ class AnnotationService:
         payload = {k: v for k, v in payload.items() if v is not None}
         rec = AnnotationRecord(
             uuid=uuid_mod.uuid4().hex,
-            doc_path=doc_path,
+            doc_path=self._norm_path(doc_path),
             page=page,
             atype=atype,
             rect_json=json.dumps(payload),
@@ -108,7 +118,7 @@ class AnnotationService:
             self._notify(doc_path)
 
     def delete_for_document(self, doc_path: str) -> None:
-        self._repo.delete_for_document(doc_path)
+        self._repo.delete_for_document(self._norm_path(doc_path))
         self._notify(doc_path)
 
     # -- PDF sync ---------------------------------------------------------
@@ -124,7 +134,7 @@ class AnnotationService:
             existing_keys.add((a.get("page"), a.get("type", "").lower(),
                                round(r[0], 1), round(r[1], 1), round(r[2], 1), round(r[3], 1)))
         applied = 0
-        for rec in self.for_document(engine.path.as_posix() if hasattr(engine.path, "as_posix") else str(engine.path)):
+        for rec in self.for_document(self._norm_path(str(engine.path))):
             if rec.atype not in TYPE_MAP_PDF:
                 continue
             try:
@@ -174,7 +184,7 @@ class AnnotationService:
 
     def import_from_pdf(self, engine: DocumentEngine) -> int:
         """Pull PDF-native annotations into the DB when missing."""
-        doc_path = str(engine.path)
+        doc_path = self._norm_path(str(engine.path))
         known = {(r.page, r.atype, r.rect_json) for r in self.for_document(doc_path)}
         imported = 0
         for a in engine.annotations():

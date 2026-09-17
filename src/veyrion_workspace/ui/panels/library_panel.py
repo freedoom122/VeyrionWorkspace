@@ -22,6 +22,12 @@ from veyrion_workspace.app import paths
 from veyrion_workspace.core.library.scanner import import_document
 from veyrion_workspace.storage.repositories import DocumentRecord, LibraryRepository
 from veyrion_workspace.ui.icons import icon
+from veyrion_workspace.ui.reference_export import (
+    LIBRARY_COLUMNS,
+    copy_table_markdown,
+    export_dialog,
+    print_table,
+)
 from veyrion_workspace.ui.theme import Palette
 from veyrion_workspace.ui.widgets import EmptyState, SectionHeader, show_toast
 from veyrion_workspace.utils.pathutils import format_size
@@ -86,6 +92,24 @@ class LibraryPanel(QWidget):
         self._ann_btn.setCheckable(True)
         self._ann_btn.setToolTip("Annotated only")
         self._ann_btn.toggled.connect(self._refresh)
+        self._export_btn = QToolButton()
+        self._export_btn.setIcon(icon("convert", "#2A2721"))
+        self._export_btn.setToolTip(
+            "Export or print a reference card of the selected documents")
+        export_menu = QMenu(self._export_btn)
+        for fmt, label in (("pdf", "Export card as PDF…"),
+                           ("csv", "Export as CSV…"),
+                           ("markdown", "Export as Markdown…")):
+            act = export_menu.addAction(label)
+            act.triggered.connect(
+                lambda _checked=False, f=fmt: self.export_selection(f))
+        copy_act = export_menu.addAction("Copy as Markdown")
+        copy_act.triggered.connect(self.copy_selection_markdown)
+        export_menu.addSeparator()
+        print_act = export_menu.addAction("Print card…")
+        print_act.triggered.connect(self.print_selection)
+        self._export_btn.setMenu(export_menu)
+        self._export_btn.setPopupMode(QToolButton.InstantPopup)
 
         bar.addWidget(QLabel(" "))
         bar.addWidget(self._search)
@@ -97,6 +121,7 @@ class LibraryPanel(QWidget):
         bar.addWidget(self._kind_combo)
         bar.addWidget(self._fav_btn)
         bar.addWidget(self._ann_btn)
+        bar.addWidget(self._export_btn)
         lay.addWidget(bar)
 
         # -- stack of views ------------------------------------------------
@@ -108,9 +133,10 @@ class LibraryPanel(QWidget):
         self._list.itemActivated.connect(lambda i: self._open_item(i.data(Qt.UserRole)))
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.customContextMenuRequested.connect(
-            lambda pos: self._context_menu(self._list.itemAt(pos).data(Qt.UserRole)
-                                           if self._list.itemAt(pos) else None,
-                                           self._list.mapToGlobal(pos)))
+            lambda pos: self._context_menu(self._list.itemAt(pos).data(Qt.UserRole),
+                                           self._list.mapToGlobal(pos))
+            if self._list.itemAt(pos)
+            else self._empty_area_menu(self._list.mapToGlobal(pos)))
         self._table = QTableWidget()
         self._table.setColumnCount(6)
         self._table.setHorizontalHeaderLabels(
@@ -125,7 +151,8 @@ class LibraryPanel(QWidget):
         self._table.customContextMenuRequested.connect(
             lambda pos: self._context_menu(self._docs[self._table.itemAt(pos).row()].path,
                                            self._table.mapToGlobal(pos))
-            if self._table.itemAt(pos) else None)
+            if self._table.itemAt(pos)
+            else self._empty_area_menu(self._table.mapToGlobal(pos)))
         self._empty = EmptyState(
             "library", "Your library is empty",
             "Open a document or add a folder to build your collection.",
@@ -149,7 +176,8 @@ class LibraryPanel(QWidget):
 
     def _refresh(self, *args) -> None:
         docs = self._library.all()
-        text = (self._search.text() or "").lower()
+        self._filter_text = (self._search.text() or "").lower()
+        text = self._filter_text
         kind_map_rev = {v: k for k, v in KIND_LABELS.items()}
         kind_filter = kind_map_rev.get(self._kind_combo.currentText(), "")
         fav_only = self._fav_btn.isChecked()
@@ -243,6 +271,102 @@ class LibraryPanel(QWidget):
                 self._table.setItem(row, col, item)
 
     # ------------------------------------------------------------------ actions
+    def selected_paths(self) -> list[str]:
+        """The user's selection in the active view; all docs when nothing is
+        selected (empty views yield an empty list)."""
+        docs: list[str] = []
+        if self._stack.currentWidget() is self._table:
+            for row in sorted({i.row() for i in self._table.selectedIndexes()}):
+                if 0 <= row < len(self._docs):
+                    docs.append(self._docs[row].path)
+        elif self._stack.currentWidget() is self._list:
+            for item in self._list.selectedItems():
+                path = item.data(Qt.UserRole)
+                if path:
+                    docs.append(path)
+        elif self._stack.currentWidget() is self._grid:
+            for item in self._grid.selectedItems():
+                path = item.data(Qt.UserRole)
+                if path:
+                    docs.append(path)
+        if docs:
+            return docs
+        return [d.path for d in self._docs]
+
+    def _selected_records(self) -> list[DocumentRecord]:
+        wanted = set(self.selected_paths())
+        return [d for d in self._docs if d.path in wanted]
+
+    def card_rows(self) -> list[tuple[str, str, str, str, str, str, str, str]]:
+        """The selected documents as card cells, in the shown sort order.
+
+        Every document in the current (filtered) view when nothing specific is
+        selected, so the filters double as a way to scope an export.
+        """
+        rows: list[tuple[str, str, str, str, str, str, str, str]] = []
+        for d in self._selected_records():
+            tags = ", ".join(self._library.tags_for(d.path))
+            rows.append((
+                d.title or Path(d.path).name,
+                d.author or "—",
+                KIND_LABELS.get(d.kind, d.kind or "—"),
+                str(d.page_count) if d.page_count else "—",
+                format_size(d.size_bytes) if d.size_bytes else "—",
+                f"{int(d.progress * 100)}%" if d.progress else "—",
+                "★" * d.rating if d.rating else "—",
+                tags or "—",
+            ))
+        return rows
+
+    def _card_title(self) -> str:
+        n = len(self.selected_paths())
+        if n != len(self._docs):
+            return f"Library Selection — {n} document" + ("s" if n != 1 else "")
+        return "Library — " + (f"{n} documents" if n != 1 else "1 document")
+
+    def _card_subtitle(self, count: int) -> str:
+        bits: list[str] = []
+        if self._filter_text:
+            bits.append(f"filter: {self._filter_text}")
+        kind = self._kind_combo.currentText()
+        if kind != "All types":
+            bits.append(kind.lower())
+        if self._fav_btn.isChecked():
+            bits.append("favorites only")
+        if self._ann_btn.isChecked():
+            bits.append("annotated only")
+        total_pages = sum(d.page_count for d in self._selected_records())
+        tail = f" · {total_pages:,} pages" if total_pages else ""
+        head = f"{count} document{'s' if count != 1 else ''}"
+        return (head + (" · " + " · ".join(bits) if bits else "") + tail)
+
+    def export_selection(self, fmt: str = "pdf"):
+        """Export the selection as a reference card (PDF, CSV or Markdown)."""
+        rows = self.card_rows()
+        return export_dialog(
+            self.window(), rows, title=self._card_title(),
+            default_name="veyrion-library.pdf", columns=LIBRARY_COLUMNS,
+            subtitle=self._card_subtitle(len(rows)), fmt=fmt,
+            empty_warning="Nothing to export — the library view is empty")
+
+    def print_selection(self) -> bool:
+        """Print a reference card of the selection."""
+        rows = self.card_rows()
+        return print_table(self.window(), rows, title=self._card_title(),
+                           subtitle=self._card_subtitle(len(rows)),
+                           columns=LIBRARY_COLUMNS,
+                           empty_warning="Nothing to print — the library view "
+                                         "is empty")
+
+    def copy_selection_markdown(self) -> bool:
+        """Copy the selection to the clipboard as a Markdown table."""
+        rows = self.card_rows()
+        return copy_table_markdown(
+            self.window(), rows, title=self._card_title(),
+            subtitle=self._card_subtitle(len(rows)),
+            columns=LIBRARY_COLUMNS,
+            empty_warning="Nothing to copy — the library view is empty")
+
     def _open_item(self, path: str) -> None:
         if path:
             self.open_requested.emit(path)
@@ -278,6 +402,20 @@ class LibraryPanel(QWidget):
         self._tasks.add_listener(on_done)
         self.reload()
 
+    def _empty_area_menu(self, global_pos) -> None:
+        """Right-click on empty table/list space: library-level actions."""
+        menu = QMenu(self)
+        add = menu.addAction("Add folder…")
+        export = (menu.addAction("Export card as Markdown…")
+                  if self._docs else None)
+        chosen = menu.exec(global_pos)
+        if chosen is None:
+            return
+        if chosen is add:
+            self._add_folder()
+        elif export is not None and chosen is export:
+            self.export_selection("markdown")
+
     def _context_menu(self, path, global_pos) -> None:
         if not path:
             return
@@ -298,6 +436,18 @@ class LibraryPanel(QWidget):
             tag_menu.addAction(tag, lambda t=tag: self._add_tag(path, t))
         new_tag = tag_menu.addAction("New tag…")
         new_tag.triggered.connect(lambda: self._new_tag(path))
+        menu.addSeparator()
+        export_menu = menu.addMenu(icon("convert", "#2A2721"), "Export")
+        for fmt, label in (("pdf", "Reference card (PDF)…"),
+                           ("csv", "Reference card (CSV)…"),
+                           ("markdown", "Reference card (Markdown)…")):
+            act = export_menu.addAction(label)
+            act.triggered.connect(
+                lambda _checked=False, f=fmt: self.export_selection(f))
+        copy_act = export_menu.addAction("Copy as Markdown")
+        copy_act.triggered.connect(self.copy_selection_markdown)
+        print_act = export_menu.addAction("Print reference card…")
+        print_act.triggered.connect(self.print_selection)
         menu.addSeparator()
         reveal = menu.addAction(icon("folder", "#6E6A61"), "Reveal in Explorer")
         props = menu.addAction(icon("info", "#6E6A61"), "Properties")
